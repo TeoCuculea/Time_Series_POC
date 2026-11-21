@@ -158,26 +158,30 @@ def context_parrot(ctx, h, D=10):
 # 4. TSFM-uri (de rulat la tine, pe GPU)
 # ----------------------------------------------------------------------------
 
-def make_chronos(model_id="amazon/chronos-bolt-small", device="cuda"):
+def make_chronos(model_id="amazon/chronos-bolt-small", device="cuda", dtype="float32"):
     """Întoarce o funcție forecast(batch_ctx, h) -> mediana prognozei.
 
-    NETESTAT aici (nu am GPU și nici acces la Hugging Face în sesiunea mea).
-    Verifică numele exact al API-ului în README-ul pachetului
-    chronos-forecasting pe care îl instalezi.
+    Testat cu chronos-forecasting 2.3.2 + transformers 5.23:
+      - predict_quantiles primește seria în `inputs=` (nu `context=`);
+      - dtype se dă cu `dtype=` (transformers 5 a redenumit `torch_dtype`).
+    float32 implicit: metrica e o DIFERENȚĂ între două prognoze aproape
+    identice, iar rotunjirile din bfloat16 ar adăuga zgomot fals în `control`.
     """
     import torch
     from chronos import BaseChronosPipeline
 
     pipe = BaseChronosPipeline.from_pretrained(
-        model_id, device_map=device, torch_dtype=torch.bfloat16
+        model_id, device_map=device, dtype=getattr(torch, dtype)
     )
 
     def forecast(batch_ctx, h):
+        # tensor 2D (lot, timp); pipeline-ul îl mută singur pe GPU
         ctx = torch.tensor(np.asarray(batch_ctx), dtype=torch.float32)
         quantiles, mean = pipe.predict_quantiles(
-            context=ctx, prediction_length=h, quantile_levels=[0.1, 0.5, 0.9]
+            inputs=ctx, prediction_length=h, quantile_levels=[0.1, 0.5, 0.9]
         )
-        return quantiles[:, :, 1].float().cpu().numpy()  # mediana
+        # quantiles: (lot, orizont, 3) în fp32 pe CPU; coloana 1 = mediana
+        return quantiles[:, :, 1].numpy()
 
     return forecast
 
