@@ -168,22 +168,35 @@ def make_chronos(model_id="amazon/chronos-bolt-small", device="cuda", dtype="flo
     identice, iar rotunjirile din bfloat16 ar adăuga zgomot fals în `control`.
     """
     import torch
-    from chronos import BaseChronosPipeline
+    from chronos import BaseChronosPipeline, Chronos2Pipeline
 
+    # from_pretrained citește config-ul modelului și alege singur clasa
+    # potrivită: ChronosBoltPipeline sau Chronos2Pipeline
     pipe = BaseChronosPipeline.from_pretrained(
         model_id, device_map=device, dtype=getattr(torch, dtype)
     )
+    q = [0.1, 0.5, 0.9]
 
-    def forecast(batch_ctx, h):
+    def forecast_bolt(batch_ctx, h):
         # tensor 2D (lot, timp); pipeline-ul îl mută singur pe GPU
         ctx = torch.tensor(np.asarray(batch_ctx), dtype=torch.float32)
         quantiles, mean = pipe.predict_quantiles(
-            inputs=ctx, prediction_length=h, quantile_levels=[0.1, 0.5, 0.9]
+            inputs=ctx, prediction_length=h, quantile_levels=q
         )
         # quantiles: (lot, orizont, 3) în fp32 pe CPU; coloana 1 = mediana
         return quantiles[:, :, 1].numpy()
 
-    return forecast
+    def forecast_chronos2(batch_ctx, h):
+        # Chronos-2 vrea 3D: (lot, variabile, timp); noi avem o singură variabilă
+        ctx = torch.tensor(np.asarray(batch_ctx), dtype=torch.float32)[:, None, :]
+        quantiles, mean = pipe.predict_quantiles(
+            inputs=ctx, prediction_length=h, quantile_levels=q,
+            cross_learning=False,  # seriile din lot NU își împrumută informație
+        )
+        # listă cu câte un tensor (1, orizont, 3) per serie -> (lot, orizont)
+        return np.stack([qt[0, :, 1].float().cpu().numpy() for qt in quantiles])
+
+    return forecast_chronos2 if isinstance(pipe, Chronos2Pipeline) else forecast_bolt
 
 
 # ----------------------------------------------------------------------------
@@ -337,7 +350,32 @@ def plot_one(forecaster, name, period=24, n_periods_ctx=8, kind="spike", amp=5,
     return out, r_in, r_abs, r_out
 
 
+# Modelele Chronos disponibile: nume scurt -> (nume în tabel, ID Hugging Face)
+CHRONOS_MODELS = {
+    "small": ("chronos_bolt_small", "amazon/chronos-bolt-small"),
+    "base": ("chronos_bolt_base", "amazon/chronos-bolt-base"),
+    "c2": ("chronos_2", "amazon/chronos-2"),
+}
+
+
+def arg(name, default=None):
+    """Valoarea de după `name` în linia de comandă (ex. --seed 3), altfel default.
+
+    Dacă opțiunea există dar nu are valoare (ex. `--chronos` singur), întoarce ""."""
+    import sys
+    if name not in sys.argv:
+        return default
+    i = sys.argv.index(name)
+    nxt = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+    return "" if nxt.startswith("--") else nxt
+
+
 if __name__ == "__main__":
+    # Exemple:
+    #   python echo_poc.py                          doar baseline-urile
+    #   python echo_poc.py --chronos                + toate modelele Chronos
+    #   python echo_poc.py --chronos small,c2       + doar cele alese
+    #   python echo_poc.py --plot --chronos small --kind burst --amp 3 --seed 3
     import sys
     P = 24
     forecasters = {
@@ -346,15 +384,22 @@ if __name__ == "__main__":
         "seasonal_median": batchify(seasonal_median, P),
         "context_parrot": lambda batch, h: np.array([context_parrot(c, h) for c in batch]),
     }
-    if "--chronos" in sys.argv:
-        forecasters["chronos_bolt_small"] = make_chronos("amazon/chronos-bolt-small")
+    chosen = arg("--chronos")
+    if chosen is not None:
+        keys = chosen.split(",") if chosen else list(CHRONOS_MODELS)
+        for key in keys:
+            name, model_id = CHRONOS_MODELS[key]
+            forecasters[name] = make_chronos(model_id)
     if "--plot" in sys.argv:
-        # câte un grafic per model, la k=1 și k=2, apoi ne oprim.
-        # --seed N alege seria (implicit 0)
-        seed = int(sys.argv[sys.argv.index("--seed") + 1]) if "--seed" in sys.argv else 0
+        # câte un grafic per model, la k=1 și k=2, apoi ne oprim
+        seed = int(arg("--seed", 0))
+        kind = arg("--kind", "spike")
+        amp = float(arg("--amp", 5))
+        amp = int(amp) if amp.is_integer() else amp   # „amp3” în numele fișierului, nu „amp3.0”
         for name, f in forecasters.items():
             for k in (1, 2):
-                path, r_in, r_abs, r_out = plot_one(f, name, period=P, k=k, seed=seed)
+                path, r_in, r_abs, r_out = plot_one(f, name, period=P, kind=kind,
+                                                    amp=amp, k=k, seed=seed)
                 print(f"{path}: ecou={r_in:.3f}, ecou_abs={r_abs:.3f}, control={r_out:.3f}")
         sys.exit(0)
     rows = run(forecasters, period=P)
