@@ -1,0 +1,13 @@
+# mediul virtual (se reface din requirements-lock.txt)
+.venv/
+
+# cache Python
+__pycache__/
+*.pyc
+
+# grafice generate (se refac cu: python echo_poc.py --plot)
+figures/
+
+# rezultate mari / modele descărcate
+*.ckpt
+*.safetensors
