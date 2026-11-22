@@ -9,9 +9,33 @@
 | Chronos-2 | `amazon/chronos-2` | chronos-forecasting 2.3.2 | Apache-2.0 |
 | TimesFM 2.5 (200M) | `google/timesfm-2.5-200m-pytorch` | timesfm 3.0.2 | Apache-2.0 |
 | TiRex | `NX-AI/TiRex` | tirex-ts 1.4.2 | **NXAI Community License** |
+| Chronos T5 small | `amazon/chronos-t5-small` | chronos-forecasting 2.3.2 | Apache-2.0 (model card) |
+| Moirai 2.0 small | `Salesforce/moirai-2.0-R-small` | uni2ts 2.0.0 (cod Apache-2.0) | **CC BY-NC 4.0** (ponderile, model card) |
 
 Licențele Apache-2.0 sunt cele declarate de pachete / model card-uri;
 de verificat încă o dată pe model card înainte de citarea finală.
+
+## Moirai 2.0: licență și mediu separat
+
+- Ponderile sunt sub **CC BY-NC 4.0**: uz necomercial permis (o disertație e
+  în regulă), cu atribuire. Codul uni2ts e Apache-2.0.
+- uni2ts 2.0.0 cere `numpy~=1.26`, `scipy~=1.11`, `torch<2.5`: fără pachete
+  pentru Python 3.13, iar torch < 2.5 nu suportă GPU-ul Blackwell (sm_120).
+  Soluția: venv separat `.venv-moirai` (Python 3.13, torch 2.11+cu128),
+  uni2ts instalat cu `--no-deps`, dependențele în versiuni recente.
+  **Nu e combinația testată de autori**: rezultatele Moirai trebuie verificate
+  (eroare de prognoză la nivelul zgomotului, cuantile ordonate) înainte de grilă.
+- Rulare: `.venv-moirai\Scripts\python.exe echo_poc.py --grid2 --tsfm moirai ...`
+  (are nevoie și de pandas / matplotlib în acel venv).
+
+## Chronos T5: eșantionare
+
+- Prognoza vine din `num_samples` traiectorii aleatoare; seed-ul e resetat la
+  fiecare apel, deci geamănul curat și cel cu anomalie primesc aceeași
+  secvență aleatoare (zgomotul se anulează parțial în diferență).
+- 20 de eșantioane (implicit): ecoul mediu variază cu ±0,002 între seed-uri;
+  pe o singură serie, abaterea între seed-uri e ~0,03.
+- Memorie: serii × eșantioane generate deodată ≤ 1500 (altfel OOM pe 16 GB).
 
 ## TiRex: NXAI Community License
 
