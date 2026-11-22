@@ -882,6 +882,95 @@ def plot_persistence(curves, out="figures/persist_dh.png"):
     return out
 
 
+# ----------------------------------------------------------------------------
+# 9. H3: reduce mascarea anomaliei ecoul?
+# ----------------------------------------------------------------------------
+
+def repair(y, start, L, how, period):
+    """Copie a seriei în care segmentul [start, start+L) e „reparat”.
+
+    how:
+      'anomalie'    -> nimic (referința: ecoul fără intervenție)
+      'masca'       -> segmentul devine NaN; modelul îl tratează ca lipsă
+      'interp'      -> interpolare liniară între punctele vecine segmentului
+      'sezonier'    -> segmentul e copiat din perioada anterioară
+      'masca_centru50' -> NaN doar pe jumătatea centrală (detector imprecis:
+                       marginile anomaliei rămân în serie)
+    Atenție: la primele 4, anomalia dispare complet, deci seria reparată e
+    identică cu geamănul curat reparat la fel. Ecoul rămas = costul golului."""
+    y2 = y.copy()
+    if how == "anomalie":
+        return y2
+    if how == "masca":
+        y2[start:start + L] = np.nan
+    elif how == "interp":
+        a, b = y2[start - 1], y2[start + L] if start + L < len(y2) else y2[start - 1]
+        y2[start:start + L] = np.linspace(a, b, L + 2)[1:-1]
+    elif how == "sezonier":
+        y2[start:start + L] = y2[start - period:start - period + L]
+    elif how == "masca_centru50":
+        q = L // 4
+        y2[start + q:start + L - q] = np.nan
+    else:
+        raise ValueError(how)
+    return y2
+
+
+H3_VARIANTS = ("anomalie", "masca", "interp", "sezonier", "masca_centru50")
+
+
+def h3_test(forecasters, periods=(24, 48), amps=(3, 5, 10), ks=(1, 2), n_series=100,
+            frac=0.5, kind="burst"):
+    """Ecoul după fiecare tip de reparație, pe rafala de P/2 (offset P/5).
+
+    Pentru fiecare serie compară prognoza seriei reparate cu prognoza
+    geamănului curat NEATINS (fără NaN), normalizat la anomalia injectată."""
+    rows = []
+    for P in periods:
+        _, L, off = proportional_configs(P, [(kind, frac)])[0]
+        C = 8 * P
+        for amp in amps:
+            for k in ks:
+                start, lo, hi = layout(C, P, k, off, L)
+                clean = np.array([make_series(C, P, seed=s) for s in range(n_series)])
+                anom = np.array([inject(y, start, L, kind, amp) for y in clean])
+                inj = (anom[:, start:start + L] - clean[:, start:start + L]).mean(axis=1)
+                for name, f in forecasters.items():
+                    med_c, q10_c, q90_c = split_q(f(clean, P))
+                    for how in H3_VARIANTS:
+                        rep = np.array([repair(y, start, L, how, P) for y in anom])
+                        med_a, q10_a, q90_a = split_q(f(rep, P))
+                        for i in range(n_series):
+                            e, _, ctrl = echo_ratio(med_a[i], med_c[i], lo, hi, inj[i])
+                            w = width_change(q10_a[i], q90_a[i], q10_c[i], q90_c[i],
+                                             lo, hi, inj[i])
+                            rows.append(dict(model=name, period=P, L=L, offset=off, amp=amp,
+                                             k=k, variant=how, series=i, echo=e,
+                                             control=ctrl, width_abs_in=w[2]))
+    return rows
+
+
+def h3_summary(df, n_boot=2000, seed=0):
+    """Ecoul mediu per variantă + reducerea față de 'anomalie', cu IC bootstrap.
+
+    reducere = 1 − ecou_reparat / ecou_anomalie (pe medii). Bootstrap-ul
+    retrage aceleași serii pentru ambele variante (date pereche)."""
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    out = []
+    for (m, P, amp, k), g in df.groupby(["model", "period", "amp", "k"]):
+        base = g[g["variant"] == "anomalie"].sort_values("series")["echo"].values
+        for how in H3_VARIANTS:
+            v = g[g["variant"] == how].sort_values("series")["echo"].values
+            red = 1 - v.mean() / base.mean()
+            idx = rng.integers(0, len(v), size=(n_boot, len(v)))
+            reds = 1 - v[idx].mean(axis=1) / base[idx].mean(axis=1)
+            out.append(dict(model=m, period=P, amp=amp, k=k, variant=how,
+                            echo=v.mean(), reducere=red,
+                            red_lo=np.quantile(reds, 0.025), red_hi=np.quantile(reds, 0.975)))
+    return pd.DataFrame(out)
+
+
 # Modelele Chronos disponibile: nume scurt -> (nume în tabel, ID Hugging Face)
 CHRONOS_MODELS = {
     "small": ("chronos_bolt_small", "amazon/chronos-bolt-small"),
@@ -1024,6 +1113,19 @@ if __name__ == "__main__":
         pd.DataFrame(curves).to_csv("results/persist_curves.csv", index=False)
         print("salvat: results/persist_series.csv, results/persist_curves.csv")
         print("salvat:", plot_persistence(curves))
+        sys.exit(0)
+
+    if "--h3" in sys.argv:
+        # H3: mascare / interpolare / imputare sezonieră a anomaliei (doar TSFM)
+        import os
+        import pandas as pd
+        n = int(arg("--n", 100))
+        df = pd.DataFrame(h3_test(tsfm, n_series=n))
+        os.makedirs("results", exist_ok=True)
+        df.to_csv("results/h3.csv", index=False)
+        summ = h3_summary(df)
+        summ.to_csv("results/h3_summary.csv", index=False)
+        print("salvat: results/h3.csv, results/h3_summary.csv")
         sys.exit(0)
 
     P = int(arg("--period", 24))
