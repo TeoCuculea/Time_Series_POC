@@ -96,8 +96,23 @@ def echo_ratio(fc_anom, fc_clean, echo_lo, echo_hi, inj_mean):
     in_abs = np.abs(d[echo_lo:echo_hi]).mean()
     mask = np.ones_like(d, dtype=bool)
     mask[echo_lo:echo_hi] = False
-    out_win = np.abs(d[mask]).mean()
+    # dacă fereastra acoperă tot orizontul (anomalie lungă cât perioada),
+    # nu rămâne nimic pentru control -> NaN, nu o medie pe zero puncte
+    out_win = np.abs(d[mask]).mean() if mask.any() else np.nan
     return in_win, in_abs, out_win
+
+
+def width_ratio(lo_a, hi_a, lo_c, hi_c, echo_lo, echo_hi):
+    """Cât de lat e intervalul q0.1–q0.9 cu anomalie față de geamănul curat.
+
+    Întoarce (în fereastra de ecou, în afara ei). 1 = neschimbat,
+    1.3 = interval cu 30% mai lat, deci modelul a devenit mai nesigur."""
+    w_a, w_c = hi_a - lo_a, hi_c - lo_c
+    mask = np.zeros_like(w_a, dtype=bool)
+    mask[echo_lo:echo_hi] = True
+    ratio_in = w_a[mask].mean() / w_c[mask].mean()
+    ratio_out = w_a[~mask].mean() / w_c[~mask].mean() if (~mask).any() else np.nan
+    return ratio_in, ratio_out
 
 
 # ----------------------------------------------------------------------------
@@ -159,7 +174,9 @@ def context_parrot(ctx, h, D=10):
 # ----------------------------------------------------------------------------
 
 def make_chronos(model_id="amazon/chronos-bolt-small", device="cuda", dtype="float32"):
-    """Întoarce o funcție forecast(batch_ctx, h) -> mediana prognozei.
+    """Întoarce o funcție forecast(batch_ctx, h) -> cuantile (lot, orizont, 3).
+
+    Ultima axă = cuantilele [0.1, 0.5, 0.9]; split_q() le desparte.
 
     Testat cu chronos-forecasting 2.3.2 + transformers 5.23:
       - predict_quantiles primește seria în `inputs=` (nu `context=`);
@@ -183,8 +200,8 @@ def make_chronos(model_id="amazon/chronos-bolt-small", device="cuda", dtype="flo
         quantiles, mean = pipe.predict_quantiles(
             inputs=ctx, prediction_length=h, quantile_levels=q
         )
-        # quantiles: (lot, orizont, 3) în fp32 pe CPU; coloana 1 = mediana
-        return quantiles[:, :, 1].numpy()
+        # quantiles: (lot, orizont, 3) în fp32 pe CPU: q0.1, mediana, q0.9
+        return quantiles.numpy()
 
     def forecast_chronos2(batch_ctx, h):
         # Chronos-2 vrea 3D: (lot, variabile, timp); noi avem o singură variabilă
@@ -193,27 +210,57 @@ def make_chronos(model_id="amazon/chronos-bolt-small", device="cuda", dtype="flo
             inputs=ctx, prediction_length=h, quantile_levels=q,
             cross_learning=False,  # seriile din lot NU își împrumută informație
         )
-        # listă cu câte un tensor (1, orizont, 3) per serie -> (lot, orizont)
-        return np.stack([qt[0, :, 1].float().cpu().numpy() for qt in quantiles])
+        # listă cu câte un tensor (1, orizont, 3) per serie -> (lot, orizont, 3)
+        return np.stack([qt[0].float().cpu().numpy() for qt in quantiles])
 
     return forecast_chronos2 if isinstance(pipe, Chronos2Pipeline) else forecast_bolt
+
+
+def split_q(fc):
+    """Desparte ieșirea unui model în (mediană, q0.1, q0.9).
+
+    Baseline-urile dau o singură valoare per pas (array 2D), deci n-au
+    interval: atunci q0.1 și q0.9 sunt None. TSFM-urile dau 3D (..., 3)."""
+    fc = np.asarray(fc)
+    if fc.ndim == 3:
+        return fc[..., 1], fc[..., 0], fc[..., 2]
+    return fc, None, None
 
 
 # ----------------------------------------------------------------------------
 # 5. Experimentul
 # ----------------------------------------------------------------------------
 
+def proportional_configs(period, kinds_fracs, offset_frac=0.2):
+    """Anomalii cu lungimea ca FRACȚIUNE din perioadă: (kind, frac) -> (kind, L, offset).
+
+    Offset-ul e tot proporțional (P/5), dar îl micșorăm dacă anomalia n-ar
+    mai încăpea în perioadă: la k=1 ar trece de originea prognozei și ar fi
+    tăiată fără nicio eroare. La L = P, offset-ul devine 0."""
+    out = []
+    for kind, frac in kinds_fracs:
+        L = max(1, round(frac * period))
+        off = min(round(offset_frac * period), period - L)
+        out.append((kind, L, off))
+    return out
+
+
 def run(forecasters, period=24, n_periods_ctx=8, horizon=None, kinds=("spike", "burst"),
-        amps=(3, 5, 10), ks=(1, 2), n_series=30, offset=5, burst_len=6):
-    """Întoarce o listă de rânduri (dict) cu raportul de ecou per serie."""
+        amps=(3, 5, 10), ks=(1, 2), n_series=30, offset=5, burst_len=6, configs=None):
+    """Întoarce o listă de rânduri (dict) cu raportul de ecou per serie.
+
+    configs: listă (kind, L, offset). Dacă lipsește, se construiește din
+    kinds / burst_len / offset, ca înainte (lungimi fixe în pași)."""
     horizon = horizon or period
     C = n_periods_ctx * period
+    if configs is None:
+        configs = [(kind, 1 if kind == "spike" else burst_len, offset) for kind in kinds]
     rows = []
-    for kind in kinds:
-        L = 1 if kind == "spike" else burst_len
+    for kind, L, off in configs:
         for amp in amps:
             for k in ks:
-                start, lo, hi = layout(C, period, k, offset, L)
+                start, lo, hi = layout(C, period, k, off, L)
+                assert hi <= horizon and start + L <= C, "anomalia/fereastra ar fi tăiată"
                 clean, anom = [], []
                 for s in range(n_series):
                     y = make_series(C, period, seed=s)
@@ -224,13 +271,20 @@ def run(forecasters, period=24, n_periods_ctx=8, horizon=None, kinds=("spike", "
                 # ca seasonal naive să dea exact 1 și pentru rafale
                 inj = (anom[:, start:start + L] - clean[:, start:start + L]).mean(axis=1)
                 for name, f in forecasters.items():
-                    fc_c = f(clean, horizon)
-                    fc_a = f(anom, horizon)
+                    med_c, q10_c, q90_c = split_q(f(clean, horizon))
+                    med_a, q10_a, q90_a = split_q(f(anom, horizon))
                     for i in range(n_series):
-                        r_in, r_abs, r_out = echo_ratio(fc_a[i], fc_c[i], lo, hi, inj[i])
-                        rows.append(dict(model=name, period=period, kind=kind,
-                                         amp=amp, k=k, series=i, echo=r_in,
-                                         echo_abs=r_abs, control=r_out))
+                        r_in, r_abs, r_out = echo_ratio(med_a[i], med_c[i], lo, hi, inj[i])
+                        row = dict(model=name, period=period, kind=kind, L=L,
+                                   len_frac=round(L / period, 3), offset=off,
+                                   amp=amp, k=k, series=i, echo=r_in,
+                                   echo_abs=r_abs, control=r_out,
+                                   echo_q90=np.nan, width_in=np.nan, width_out=np.nan)
+                        if q90_c is not None:   # doar TSFM-urile au interval
+                            row["echo_q90"] = echo_ratio(q90_a[i], q90_c[i], lo, hi, inj[i])[0]
+                            row["width_in"], row["width_out"] = width_ratio(
+                                q10_a[i], q90_a[i], q10_c[i], q90_c[i], lo, hi)
+                        rows.append(row)
     return rows
 
 
@@ -249,10 +303,13 @@ def summarize(rows):
     import pandas as pd
     df = pd.DataFrame(rows)
     df["high"] = df["echo"] > 0.5
-    return (df.groupby(["model", "period", "kind", "k", "amp"])
-              .agg(echo=("echo", "mean"), echo_abs=("echo_abs", "mean"),
-                   frac_high=("high", "mean"), control=("control", "mean"))
-              .round(3))
+    keys = [c for c in ["model", "period", "kind", "L", "k", "amp"] if c in df]
+    agg = dict(echo=("echo", "mean"), echo_abs=("echo_abs", "mean"),
+               frac_high=("high", "mean"), control=("control", "mean"))
+    for c in ("echo_q90", "width_in", "width_out"):   # NaN la baseline-uri
+        if c in df:
+            agg[c] = (c, "mean")
+    return df.groupby(keys).agg(**agg).round(3)
 
 
 # ----------------------------------------------------------------------------
@@ -284,7 +341,7 @@ def plot_one(forecaster, name, period=24, n_periods_ctx=8, kind="spike", amp=5,
     clean = make_series(C, period, seed=seed)
     anom = inject(clean, start, L, kind, amp)
     inj = (anom[start:start + L] - clean[start:start + L]).mean()
-    fc_c, fc_a = forecaster(np.array([clean, anom]), h)   # lot de 2 serii
+    fc_c, fc_a = split_q(forecaster(np.array([clean, anom]), h))[0]  # lot de 2, mediana
     r_in, r_abs, r_out = echo_ratio(fc_a, fc_c, lo, hi, inj)
 
     # [B] Axa timpului: 0..C-1 = context, C..C+h-1 = orizont.
@@ -513,6 +570,7 @@ if __name__ == "__main__":
     #   python echo_poc.py --plot --chronos small --kind burst --amp 3 --seed 3
     #   python echo_poc.py --grid --chronos         grila P=24 și 48 -> results/grid.csv
     #   python echo_poc.py --main                   graficul principal din results/grid.csv
+    #   python echo_poc.py --grid2 --chronos --n 100  anomalii proporționale + incertitudine
     import sys
 
     if "--main" in sys.argv:
@@ -559,6 +617,25 @@ if __name__ == "__main__":
         os.makedirs("results", exist_ok=True)
         out = arg("--out") or "results/grid.csv"
         pd.DataFrame(rows).to_csv(out, index=False)   # un rând per serie
+        print(f"{len(rows)} rânduri salvate în {out}\n")
+        print(summarize(rows).to_string())
+        sys.exit(0)
+
+    if "--grid2" in sys.argv:
+        # Anomalii proporționale cu perioada: rafale de P/4, P/2, P și level de P.
+        # Salvează și ecoul pe q0.9 + lățimea intervalului (doar la TSFM-uri).
+        import os
+        import pandas as pd
+        n = int(arg("--n", 100))
+        kinds_fracs = [("burst", 0.25), ("burst", 0.5), ("burst", 1.0), ("level", 1.0)]
+        rows = []
+        for P in (24, 48):
+            cfg = proportional_configs(P, kinds_fracs)
+            print(f"P={P}: (tip, L, offset) = {cfg}")
+            rows += run({**baselines(P), **tsfm}, period=P, configs=cfg, n_series=n)
+        os.makedirs("results", exist_ok=True)
+        out = arg("--out") or "results/grid2.csv"
+        pd.DataFrame(rows).to_csv(out, index=False)
         print(f"{len(rows)} rânduri salvate în {out}\n")
         print(summarize(rows).to_string())
         sys.exit(0)
