@@ -1,5 +1,6 @@
 # mediul virtual (se reface din requirements-lock.txt)
 .venv/
+.venv-moirai/
 
 # cache Python
 __pycache__/

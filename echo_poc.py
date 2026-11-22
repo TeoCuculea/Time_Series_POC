@@ -227,6 +227,65 @@ def make_chronos(model_id="amazon/chronos-bolt-small", device="cuda", dtype="flo
     return forecast_chronos2 if isinstance(pipe, Chronos2Pipeline) else forecast_bolt
 
 
+def make_chronos_t5(model_id="amazon/chronos-t5-small", device="cuda", num_samples=20, seed=0):
+    """Chronos original (T5): valori cuantizate în tokeni, prognoză prin EȘANTIONARE.
+
+    Spre deosebire de Bolt, fiecare apel trage num_samples traiectorii
+    aleatoare; mediana și cuantilele vin din aceste eșantioane. Ca rezultatul
+    să fie reproductibil, resetăm seed-ul la FIECARE apel: geamănul curat și
+    cel cu anomalie primesc astfel aceeași secvență aleatoare, iar o parte
+    din zgomotul de eșantionare se anulează în diferență.
+    Ieșire: (lot, orizont, 3) = q0.1, mediana, q0.9, ca la make_chronos."""
+    import torch
+    from chronos import BaseChronosPipeline
+    pipe = BaseChronosPipeline.from_pretrained(model_id, device_map=device, dtype=torch.float32)
+
+    def forecast(batch_ctx, h, seed=seed, num_samples=num_samples):
+        # serii × eșantioane generate deodată: T5 copiază contextul codificat
+        # pentru fiecare eșantion; 4000 nu mai încap în 16 GB, 2000 da
+        chunk = max(1, 1500 // num_samples)
+        torch.manual_seed(seed)
+        ctx = torch.tensor(np.asarray(batch_ctx), dtype=torch.float32)
+        outs = []
+        for i in range(0, len(ctx), chunk):
+            q, _ = pipe.predict_quantiles(inputs=ctx[i:i + chunk], prediction_length=h,
+                                          quantile_levels=[0.1, 0.5, 0.9],
+                                          num_samples=num_samples)
+            outs.append(q.numpy())
+        return np.concatenate(outs)
+
+    return forecast
+
+
+def make_moirai(model_id="Salesforce/moirai-2.0-R-small", device="cuda", batch_size=256):
+    """Moirai 2.0 (Salesforce), ieșire (lot, orizont, 3) ca la celelalte modele.
+
+    ATENȚIE: rulează doar în .venv-moirai (uni2ts cere numpy 1.26 / torch<2.5,
+    incompatibile cu mediul principal; vezi NOTES.md). Ponderile sunt sub
+    CC BY-NC 4.0. Valorile NaN sunt completate de uni2ts cu media cauzală,
+    iar modelul primește și masca valorilor observate."""
+    import torch
+    from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
+    module = Moirai2Module.from_pretrained(model_id)
+    model = Moirai2Forecast(module=module, prediction_length=1, context_length=1,
+                            target_dim=1, feat_dynamic_real_dim=0,
+                            past_feat_dynamic_real_dim=0).to(device).eval()
+    levels = [round(float(x), 3) for x in module.quantile_levels]
+    idx = [levels.index(0.1), levels.index(0.5), levels.index(0.9)]
+
+    def forecast(batch_ctx, h):
+        batch_ctx = np.asarray(batch_ctx, dtype=np.float32)
+        outs = []
+        with model.hparams_context(prediction_length=h, context_length=batch_ctx.shape[1]):
+            for i in range(0, len(batch_ctx), batch_size):
+                p = model.predict(past_target=[c for c in batch_ctx[i:i + batch_size]])
+                outs.append(np.asarray(p).reshape(len(p), len(levels), h))   # (lot, cuantile, h)
+        q = np.concatenate(outs)[:, idx, :]                                  # (lot, 3, h)
+        return np.transpose(q, (0, 2, 1))                                    # (lot, h, 3)
+
+    return forecast
+
+
 def make_timesfm(model_id="google/timesfm-2.5-200m-pytorch", max_context=512, max_horizon=128):
     """TimesFM 2.5 (Google), cu aceeași ieșire ca make_chronos: (lot, orizont, 3).
 
@@ -499,6 +558,8 @@ TSFM_STYLE = {
     "chronos_2": ("Chronos-2", "#1baf7a", "^"),
     "timesfm_2p5": ("TimesFM 2.5", "#eda100", "v"),
     "tirex": ("TiRex", "#e87ba4", "P"),
+    "chronos_t5_small": ("Chronos T5 small", "#008300", "X"),
+    "moirai_2_small": ("Moirai 2.0 small", "#6250d6", "*"),
 }
 H1_THRESHOLD = 0.3
 
@@ -1447,6 +1508,8 @@ TSFM_MODELS = {
        for key, (name, mid) in CHRONOS_MODELS.items()},
     "timesfm": ("timesfm_2p5", make_timesfm),
     "tirex": ("tirex", make_tirex),
+    "t5": ("chronos_t5_small", make_chronos_t5),
+    "moirai": ("moirai_2_small", make_moirai),     # doar din .venv-moirai
 }
 
 
@@ -1533,10 +1596,12 @@ if __name__ == "__main__":
         for key in keys:
             name, model_id = CHRONOS_MODELS[key]
             tsfm[name] = make_chronos(model_id)
-    # --tsfm = toate cele 5 modele; --tsfm timesfm,tirex = doar cele alese
+    # --tsfm = cele 5 modele de bază; --tsfm t5 sau --tsfm moirai = doar cele alese
+    # (moirai doar cu interpretorul din .venv-moirai)
     chosen = arg("--tsfm")
     if chosen is not None:
-        for key in (chosen.split(",") if chosen else list(TSFM_MODELS)):
+        default = ["small", "base", "c2", "timesfm", "tirex"]
+        for key in (chosen.split(",") if chosen else default):
             name, loader = TSFM_MODELS[key]
             if name not in tsfm:
                 tsfm[name] = loader()
