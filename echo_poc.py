@@ -22,10 +22,14 @@ import numpy as np
 # 1. Generatorul de serii
 # ----------------------------------------------------------------------------
 
-def make_series(n, period, noise=0.1, seed=0):
-    """Serie sezonieră: sinus + o armonică + zgomot gaussian. Amplitudine ~1."""
+def make_series(n, period, noise=0.1, seed=0, shift=0):
+    """Serie sezonieră: sinus + o armonică + zgomot gaussian. Amplitudine ~1.
+
+    shift (implicit 0 = exact ca înainte): deplasează TOATĂ unda cu `shift`
+    pași, fără să-i schimbe forma și fără să schimbe zgomotul. Îl folosim ca
+    să punem anomalia pe vale / pantă / vârf fără să-i mutăm poziția în timp."""
     rng = np.random.default_rng(seed)
-    t = np.arange(n)
+    t = np.arange(n) + shift
     phase = rng.uniform(0, 2 * np.pi)
     y = np.sin(2 * np.pi * t / period + phase) + 0.3 * np.sin(4 * np.pi * t / period)
     return y + noise * rng.standard_normal(n)
@@ -971,6 +975,38 @@ def h3_summary(df, n_boot=2000, seed=0):
     return pd.DataFrame(out)
 
 
+def mask_cost_test(forecasters, periods=(24, 48), ks=(1, 2), n_series=100, frac=0.5):
+    """Costul unei alarme false: mascăm (NaN) un segment NORMAL de P/2.
+
+    Pe geamănul curat, la aceeași poziție ca la H3 (offset P/5), comparăm
+    prognoza cu și fără mască față de viitorul real al seriei:
+      mae_full / mae_mask     - eroarea medie absolută pe tot orizontul
+      width_full / width_mask - lățimea medie a intervalului q0.1–q0.9
+    Viitorul real vine din aceeași serie generată mai lung (același seed
+    dă aceleași prime C valori, verificat)."""
+    rows = []
+    for P in periods:
+        _, L, off = proportional_configs(P, [("burst", frac)])[0]
+        C = 8 * P
+        full = np.array([make_series(C + P, P, seed=s) for s in range(n_series)])
+        ctx, truth = full[:, :C], full[:, C:]
+        for k in ks:
+            start, lo, hi = layout(C, P, k, off, L)
+            masked = ctx.copy()
+            masked[:, start:start + L] = np.nan
+            for name, f in forecasters.items():
+                med_f, q10_f, q90_f = split_q(f(ctx, P))
+                med_m, q10_m, q90_m = split_q(f(masked, P))
+                for i in range(n_series):
+                    rows.append(dict(
+                        model=name, period=P, k=k, series=i,
+                        mae_full=np.abs(med_f[i] - truth[i]).mean(),
+                        mae_mask=np.abs(med_m[i] - truth[i]).mean(),
+                        width_full=(q90_f[i] - q10_f[i]).mean(),
+                        width_mask=(q90_m[i] - q10_m[i]).mean()))
+    return rows
+
+
 # ----------------------------------------------------------------------------
 # 10. Plauzibilitate: anomalia rămâne în intervalul normal al seriei?
 # ----------------------------------------------------------------------------
@@ -1007,6 +1043,247 @@ def add_exceedance(df, n_periods_ctx=8):
         rows.append(dict(period=P, kind=kind, L=L, offset=off, amp=amp, k=k, series=s,
                          exceed_frac=ef, exceed_max=em))
     return df.merge(pd.DataFrame(rows), on=keys, how="left")
+
+
+def position_shift(period, seed, center, j, n_pos=8):
+    """Deplasarea care pune centrul anomaliei în punctul j (din n_pos) al ciclului.
+
+    Punctul 0 = valea formei fără zgomot a seriei `seed`; punctele următoare
+    sunt la câte P/n_pos pași după vale. Întoarce (shift, level, eticheta):
+    level = valoarea formei în acel punct, scalată 0 (vale) .. 1 (vârf)."""
+    shape = make_series(period, period, noise=0.0, seed=seed)   # o perioadă, fără zgomot
+    v0 = int(np.argmin(shape))
+    p = (v0 + j * period // n_pos) % period
+    shift = (p - center) % period
+    level = (shape[p] - shape.min()) / (shape.max() - shape.min())
+    label = "vale" if level < 1 / 3 else ("vârf" if level > 2 / 3 else "pantă")
+    return shift, level, label
+
+
+def amp_to_reach(clean, start, L, target, direction=+1):
+    """Amplitudinea (în σ) la care rafala atinge EXACT nivelul `target`.
+
+    Rafala adaugă amp·σ·w[t] (w = clopot Hann). Punctul t atinge ținta când
+    amp = (target − clean[t]) / (σ·w[t]); primul punct care o atinge dă
+    minimul. direction=−1: aceeași logică pentru o rafală în jos (drop)."""
+    w = np.hanning(L + 2)[1:-1]
+    sd = clean.std()
+    seg = clean[start:start + L]
+    return np.min(direction * (target - seg) / (sd * w))
+
+
+SWEEP_MULTS = (0.25, 0.5, 0.75, 0.95, 1.25, 1.5, 2.0, 3.0)
+
+
+def plausibility_test(forecasters, periods=(24, 48), n_pos=8, n_series=100,
+                      mults=SWEEP_MULTS, out_margin=2.0, drop_fixed=5.0, frac=0.5):
+    """Pasul B: aceeași rafală P/2 (offset P/5, k=1), mutată pe 8 puncte ale ciclului.
+
+    La fiecare punct și serie, variante (amplitudini calculate pe serie):
+      sweep × m   : m · a_in, unde a_in = amplitudinea care atinge maximul contextului
+      in_range    : a_in (atinge maximul, nu-l depășește)
+      out_range   : depășește maximul cu out_margin·σ
+      drop_in     : rafală în jos care atinge minimul contextului
+      drop_out    : rafală în jos sub minim cu out_margin·σ
+      drop_fixed  : rafală în jos de drop_fixed·σ („pană de curent”)
+    Toate variantele unui punct trec printr-un singur apel de model (lot mare)."""
+    rows = []
+    for P in periods:
+        _, L, off = proportional_configs(P, [("burst", frac)])[0]
+        C = 8 * P
+        start, lo, hi = layout(C, P, 1, off, L)
+        center = start + L // 2
+        for j in range(n_pos):
+            info, cleans = [], []
+            for s in range(n_series):
+                sh, level, label = position_shift(P, s, center, j, n_pos)
+                y = make_series(C, P, seed=s, shift=sh)
+                sd = y.std()
+                info.append(dict(series=s, level=level, label=label, sd=sd,
+                                 a_in=amp_to_reach(y, start, L, y.max(), +1),
+                                 a_out=amp_to_reach(y, start, L, y.max() + out_margin * sd, +1),
+                                 d_in=amp_to_reach(y, start, L, y.min(), -1),
+                                 d_out=amp_to_reach(y, start, L, y.min() - out_margin * sd, -1)))
+                cleans.append(y)
+            cleans = np.array(cleans)
+            # lista variantelor: (nume, multiplu, direcție, amplitudine per serie)
+            variants = [("sweep", m, +1, [m * x["a_in"] for x in info]) for m in mults]
+            # 0.999: fără el, rotunjirile scot vârful anomaliei cu ~1e-16 peste maxim
+            variants += [("in_range", 1.0, +1, [0.999 * x["a_in"] for x in info]),
+                         ("out_range", np.nan, +1, [x["a_out"] for x in info]),
+                         ("drop_in", 1.0, -1, [0.999 * x["d_in"] for x in info]),
+                         ("drop_out", np.nan, -1, [x["d_out"] for x in info]),
+                         ("drop_fixed", np.nan, -1, [drop_fixed] * n_series)]
+            batches = [cleans]
+            for _, _, sign, amps in variants:
+                batches.append(np.array([inject(y, start, L, "burst", sign * a)
+                                         for y, a in zip(cleans, amps)]))
+            big = np.concatenate(batches)
+            for name, f in forecasters.items():
+                med, q10, q90 = split_q(f(big, P))
+                for v, (vname, mult, sign, amps) in enumerate(variants):
+                    b = (v + 1) * n_series            # blocul variantei în lotul mare
+                    for i in range(n_series):
+                        anom = batches[v + 1][i]
+                        inj = (anom[start:start + L] - cleans[i, start:start + L]).mean()
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            e, e_abs, ctrl = echo_ratio(med[b + i], med[i], lo, hi, inj)
+                            tail_a, tail_c = (q90, q90) if sign > 0 else (q10, q10)
+                            e_tail = echo_ratio(tail_a[b + i], tail_c[i], lo, hi, inj)[0]
+                            w_abs = width_change(q10[b + i], q90[b + i], q10[i], q90[i],
+                                                 lo, hi, inj)[2]
+                        ef, em = exceedance(cleans[i], anom, start, L)
+                        x = info[i]
+                        rows.append(dict(model=name, period=P, pos=j, level=x["level"],
+                                         label=x["label"], variant=vname, mult=mult,
+                                         direction=sign, amp=sign * amps[i],
+                                         a_in=x["a_in"], d_in=x["d_in"], series=i,
+                                         echo=e, echo_abs=e_abs, echo_tail=e_tail,
+                                         width_abs_in=w_abs, control=ctrl,
+                                         exceed_frac=ef, exceed_max=em,
+                                         shift_sigma=e * abs(inj) / x["sd"]))
+    return rows
+
+
+def plausibility_summary(df, min_amp=0.5, n_boot=2000, seed=0):
+    """Contrastele din regula de decizie, pe (model, P, eticheta poziției).
+
+    Exclude seriile la care amplitudinea „în interval” e < min_amp σ
+    (a_in pentru rafala în sus, d_in pentru drop). Întoarce (contraste, excluse):
+      in_out    : echo(in_range) − echo(out_range), plus aceeași diferență pe shift_sigma
+      drop      : la fel pentru drop_in − drop_out
+      kink      : [echo(0.95) − echo(1.25)] − [echo(0.5) − echo(0.75)]  (cădere la prag)
+    Toate pe date pereche (aceeași serie), IC bootstrap 95%."""
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+
+    def ci(x):
+        idx = rng.integers(0, len(x), size=(n_boot, len(x)))
+        m = x[idx].mean(axis=1)
+        return x.mean(), np.quantile(m, 0.025), np.quantile(m, 0.975)
+
+    def wide(g, col):
+        return g.pivot_table(index="series", columns="key", values=col)
+
+    out = []
+    for (m, P, lab), g in df.groupby(["model", "period", "label"]):
+        g = g.assign(key=np.where(g["variant"] == "sweep", "x" + g["mult"].astype(str), g["variant"]))
+        up_ok = g[g["a_in"] >= min_amp]
+        dn_ok = g[g["d_in"] >= min_amp]
+        contrasts = []
+        if len(up_ok):
+            e, s = wide(up_ok, "echo"), wide(up_ok, "shift_sigma")
+            contrasts += [("in_out_echo", (e["in_range"] - e["out_range"]).dropna().values),
+                          ("in_out_shift", (s["in_range"] - s["out_range"]).dropna().values),
+                          ("kink", ((e["x0.95"] - e["x1.25"]) - (e["x0.5"] - e["x0.75"])).dropna().values)]
+        if len(dn_ok):
+            e, s = wide(dn_ok, "echo"), wide(dn_ok, "shift_sigma")
+            contrasts += [("drop_in_out_echo", (e["drop_in"] - e["drop_out"]).dropna().values),
+                          ("drop_in_out_shift", (s["drop_in"] - s["drop_out"]).dropna().values)]
+        for cname, x in contrasts:
+            if len(x) >= 5:
+                mean, lo, hi = ci(np.asarray(x, dtype=float))
+                out.append(dict(model=m, period=P, label=lab, contrast=cname, n=len(x),
+                                mean=mean, ci_lo=lo, ci_hi=hi))
+    # câte serii au fost excluse: nu depinde de model, deci luăm un singur model
+    one = df[df["model"] == df["model"].iloc[0]].drop_duplicates(["period", "pos", "series"])
+    excl = (one.assign(up_excl=one["a_in"] < min_amp, dn_excl=one["d_in"] < min_amp)
+               .groupby(["period", "pos"])
+               .agg(level=("level", "mean"), up_excluse=("up_excl", "sum"),
+                    drop_excluse=("dn_excl", "sum"), n=("series", "count")).reset_index())
+    return pd.DataFrame(out), excl
+
+
+def plot_plausibility(df, min_amp=0.5, out_pos="figures/plaus_positions.png",
+                      out_dose="figures/plaus_dose.png"):
+    """(a) echo pe cele 8 puncte ale ciclului: in vs out, rafală în sus și drop.
+    (b) doză–răspuns: echo față de multiplul lui a_in (linia verticală = pragul)."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    models = [m for m in TSFM_STYLE if m in set(df["model"])]
+    periods = sorted(df["period"].unique())
+    up = df[df["a_in"] >= min_amp]
+    dn = df[df["d_in"] >= min_amp]
+
+    def style(ax, r, c, xlabel):
+        ax.axhline(0, color=C_MUTED, lw=0.8)
+        ax.axhline(H1_THRESHOLD, color=C_INK, lw=1, ls="--")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.spines[["left", "bottom"]].set_color(C_MUTED)
+        ax.tick_params(colors=C_MUTED, labelsize=7)
+        ax.grid(axis="y", color=C_GRID, lw=0.6)
+        ax.set_axisbelow(True)
+        if c == 0:
+            ax.set_ylabel(f"echo, P={periods[r]}", fontsize=9)
+        if r == len(periods) - 1:
+            ax.set_xlabel(xlabel, fontsize=8)
+
+    # (a) pozițiile
+    fig, axes = plt.subplots(len(periods), len(models), figsize=(3.1 * len(models), 3.2 * len(periods)),
+                             sharey=True, squeeze=False)
+    series_def = [("in_range", up, C_CLEAN, "-", "în sus, în interval"),
+                  ("out_range", up, C_ANOM, "-", "în sus, peste interval"),
+                  ("drop_in", dn, C_CLEAN, "--", "drop, în interval"),
+                  ("drop_out", dn, C_ANOM, "--", "drop, sub interval")]
+    for r, P in enumerate(periods):
+        for c, m in enumerate(models):
+            ax = axes[r, c]
+            for vname, src, col, ls, lbl in series_def:
+                g = src[(src["model"] == m) & (src["period"] == P) & (src["variant"] == vname)]
+                s = g.groupby("pos")["echo"].agg(["mean", "sem"])
+                ax.fill_between(s.index, s["mean"] - 1.96 * s["sem"], s["mean"] + 1.96 * s["sem"],
+                                color=col, alpha=0.15, lw=0)
+                ax.plot(s.index, s["mean"], color=col, ls=ls, lw=2, marker="o", ms=3, label=lbl)
+            lv = df[(df["period"] == P) & (df["model"] == m)].groupby("pos")["level"].mean()
+            ax.set_xticks(lv.index)
+            ax.set_xticklabels([f"{j}\n{v:.1f}" for j, v in lv.items()])
+            ax.set_title(TSFM_STYLE[m][0], fontsize=9, color=C_INK, loc="left")
+            style(ax, r, c, "punct în ciclu\n(nivel: 0 = vale, 1 = vârf)")
+    fig.suptitle("Ecoul după poziția anomaliei în ciclu: în interval vs. peste interval "
+                 "(rafală P/2, k=1, medie ± IC 95%)", fontsize=11, color=C_INK, x=0.01, ha="left")
+    h, l = axes[0, 0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", ncol=4, frameon=False, fontsize=9)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+    os.makedirs(os.path.dirname(out_pos) or ".", exist_ok=True)
+    fig.savefig(out_pos, dpi=150)
+    plt.close(fig)
+
+    # (b) doză–răspuns
+    ramp = {"vale": "#86b6ef", "pantă": "#2a78d6", "vârf": "#0d366b"}
+    fig, axes = plt.subplots(len(periods), len(models), figsize=(3.1 * len(models), 3.2 * len(periods)),
+                             sharey=True, squeeze=False)
+    sw = up[up["variant"] == "sweep"]
+    for r, P in enumerate(periods):
+        for c, m in enumerate(models):
+            ax = axes[r, c]
+            ax.axvline(1, color=C_MUTED, lw=1, ls=":")
+            for lab, col in ramp.items():
+                g = sw[(sw["model"] == m) & (sw["period"] == P) & (sw["label"] == lab)]
+                if not len(g):
+                    continue
+                s = g.groupby("mult")["echo"].agg(["mean", "sem"])
+                ax.fill_between(s.index, s["mean"] - 1.96 * s["sem"], s["mean"] + 1.96 * s["sem"],
+                                color=col, alpha=0.15, lw=0)
+                ax.plot(s.index, s["mean"], color=col, lw=2, marker="o", ms=3, label=lab)
+            ax.set_xscale("log")
+            from matplotlib.ticker import NullLocator
+            ax.xaxis.set_minor_locator(NullLocator())   # altfel apar etichete „3×10⁻¹” suprapuse
+            ax.set_xticks([0.25, 0.5, 1, 2, 3])
+            ax.set_xticklabels(["0,25", "0,5", "1", "2", "3"])
+            ax.set_title(TSFM_STYLE[m][0], fontsize=9, color=C_INK, loc="left")
+            style(ax, r, c, "amplitudine / a_in\n(1 = atinge maximul seriei)")
+    fig.suptitle("Doză–răspuns: ecoul față de amplitudine, raportată la pragul intervalului "
+                 "(rafală P/2, k=1, medie ± IC 95%)", fontsize=11, color=C_INK, x=0.01, ha="left")
+    h, l = axes[0, 0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", ncol=3, frameon=False, fontsize=9, title="poziția anomaliei",
+               title_fontsize=9)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.95))
+    fig.savefig(out_dose, dpi=150)
+    plt.close(fig)
+    return out_pos, out_dose
 
 
 def plot_exceed(df, out="figures/exceed_echo.png", len_frac=0.5, k=1):
@@ -1229,6 +1506,30 @@ if __name__ == "__main__":
         summ = h3_summary(df)
         summ.to_csv("results/h3_summary.csv", index=False)
         print("salvat: results/h3.csv, results/h3_summary.csv")
+        sys.exit(0)
+
+    if "--plaus" in sys.argv:
+        # Pasul B de plauzibilitate: poziție în ciclu × în/peste interval × direcție
+        import os
+        import pandas as pd
+        df = pd.DataFrame(plausibility_test(tsfm, n_series=int(arg("--n", 100))))
+        os.makedirs("results", exist_ok=True)
+        df.to_csv("results/plausibility.csv", index=False)
+        summ, excl = plausibility_summary(df)
+        summ.to_csv("results/plausibility_summary.csv", index=False)
+        excl.to_csv("results/plausibility_excluded.csv", index=False)
+        print("salvat: results/plausibility*.csv")
+        print("salvat:", *plot_plausibility(df))
+        sys.exit(0)
+
+    if "--maskcost" in sys.argv:
+        # costul unei alarme false: mască NaN pe un segment normal
+        import os
+        import pandas as pd
+        df = pd.DataFrame(mask_cost_test(tsfm, n_series=int(arg("--n", 100))))
+        os.makedirs("results", exist_ok=True)
+        df.to_csv("results/mask_cost.csv", index=False)
+        print("salvat: results/mask_cost.csv")
         sys.exit(0)
 
     P = int(arg("--period", 24))
