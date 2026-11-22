@@ -350,6 +350,141 @@ def plot_one(forecaster, name, period=24, n_periods_ctx=8, kind="spike", amp=5,
     return out, r_in, r_abs, r_out
 
 
+# ----------------------------------------------------------------------------
+# 7. Graficul principal: ecoul mediu per model, cu interval bootstrap
+# ----------------------------------------------------------------------------
+
+def bootstrap_ci(x, n_boot=5000, level=0.95, seed=0):
+    """Interval de încredere percentilă pentru media lui x.
+
+    Retrage cu înlocuire n valori din x de n_boot ori, calculează media de
+    fiecare dată și ia cuantilele 2.5% / 97.5% ale acestor medii."""
+    x = np.asarray(x, dtype=float)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(x), size=(n_boot, len(x)))
+    means = x[idx].mean(axis=1)
+    a = (1 - level) / 2
+    return np.quantile(means, a), np.quantile(means, 1 - a)
+
+
+# Modelele afișate colorat (sloturile 1-3 din paleta validată + forme diferite,
+# ca identitatea să nu depindă doar de culoare)
+TSFM_STYLE = {
+    "chronos_bolt_small": ("Chronos-Bolt small", "#2a78d6", "o"),
+    "chronos_bolt_base": ("Chronos-Bolt base", "#eb6834", "s"),
+    "chronos_2": ("Chronos-2", "#1baf7a", "^"),
+}
+H1_THRESHOLD = 0.3
+
+
+def plot_main(csv="results/grid.csv", k=1, metric="echo", out=None):
+    """Ecoul mediu (± IC bootstrap 95%) per model, pe perioadă × tip × amplitudine.
+
+    Rânduri = tip de anomalie, coloane = perioadă, axa x = amplitudinea.
+    Baseline-urile apar ca referințe gri, pragul H1 ca linie întreruptă.
+    Întoarce (calea figurii, tabelul cu medii și intervale)."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    # [A] Date: media și IC per (model, perioadă, tip, amplitudine) la k ales
+    df = pd.read_csv(csv)
+    df = df[df["k"] == k]
+    rows = []
+    for (model, P, kind, amp), g in df.groupby(["model", "period", "kind", "amp"]):
+        lo, hi = bootstrap_ci(g[metric].values)
+        rows.append(dict(model=model, period=P, kind=kind, amp=amp, k=k,
+                         mean=g[metric].mean(), ci_lo=lo, ci_hi=hi, n=len(g)))
+    tab = pd.DataFrame(rows)
+
+    periods = sorted(tab["period"].unique())
+    kinds = [kd for kd in ("burst", "spike") if kd in set(tab["kind"])]
+    amps = sorted(tab["amp"].unique())
+    kind_ro = {"burst": "rafală", "spike": "vârf"}
+
+    fig, axes = plt.subplots(len(kinds), len(periods), figsize=(10, 3.6 * len(kinds)),
+                             sharey=True, squeeze=False)
+    # pozițiile pe x: câte un grup per amplitudine, modelele decalate în grup
+    names = list(TSFM_STYLE) + ["context_parrot"]
+    dx = np.linspace(-0.27, 0.27, len(names))
+
+    for r, kind in enumerate(kinds):
+        for c, P in enumerate(periods):
+            ax = axes[r, c]
+            sub = tab[(tab["kind"] == kind) & (tab["period"] == P)]
+
+            # [B] Referințe: pragul H1 și media pe faze (constantă 1/8 = 0.125)
+            ax.axhline(H1_THRESHOLD, color=C_INK, lw=1.2, ls="--")
+            ax.axhline(0.125, color=C_MUTED, lw=1, ls=":")
+            ax.axhline(0, color=C_MUTED, lw=0.8)
+
+            # [C] Mediana pe faze: segment scurt gri în fiecare grup
+            #     (depinde de amplitudine, dar rămâne aproape de 0)
+            for j, amp in enumerate(amps):
+                m = sub[(sub["model"] == "seasonal_median") & (sub["amp"] == amp)]
+                if len(m):
+                    ax.hlines(m["mean"].iloc[0], j - 0.4, j + 0.4, color=C_MUTED,
+                              lw=1.5, label="mediana pe faze" if j == 0 else None)
+
+            # [D] Puncte + IC: modelele TSFM colorate, context_parrot gri
+            for i, name in enumerate(names):
+                if name in TSFM_STYLE:
+                    label, color, marker = TSFM_STYLE[name]
+                else:
+                    label, color, marker = "context parroting", C_MUTED, "D"
+                for j, amp in enumerate(amps):
+                    m = sub[(sub["model"] == name) & (sub["amp"] == amp)]
+                    if not len(m):
+                        continue
+                    m = m.iloc[0]
+                    x = j + dx[i]
+                    ax.vlines(x, m["ci_lo"], m["ci_hi"], color=color, lw=2)
+                    ax.plot(x, m["mean"], marker=marker, ms=7, color=color,
+                            mec="white", mew=1, ls="none",
+                            label=label if j == 0 else None)
+
+            # [E] Axe și titluri
+            ax.set_xticks(range(len(amps)))
+            ax.set_xticklabels([f"{a:g}σ" for a in amps])
+            ax.set_xlim(-0.5, len(amps) - 0.5)
+            ax.set_title(f"{kind_ro[kind]}, perioadă {P}", fontsize=10, color=C_INK,
+                         loc="left")
+            if c == 0:
+                ax.set_ylabel(f"{metric} (k={k})", fontsize=9)
+            if r == len(kinds) - 1:
+                ax.set_xlabel("amplitudinea anomaliei", fontsize=9)
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.spines[["left", "bottom"]].set_color(C_MUTED)
+            ax.tick_params(colors=C_MUTED, labelsize=8)
+            ax.grid(axis="y", color=C_GRID, lw=0.8)
+            ax.set_axisbelow(True)
+
+    lo = min(-0.02, tab[tab["model"].isin(names)]["ci_lo"].min() - 0.01)
+    axes[0, 0].set_ylim(lo, 0.36)
+
+    # [F] Titlu, notă despre seasonal naive (=1, în afara axei), legendă jos
+    fig.suptitle(f"Ecoul anomaliei la k={k} perioade înainte de origine "
+                 f"(media pe 30 de serii, IC bootstrap 95%)", fontsize=11,
+                 color=C_INK, x=0.01, ha="left")
+    fig.text(0.01, 0.935, "Referințe: seasonal naive = 1 (copie completă, deasupra axei); "
+             "media pe faze = 0,125; mediana pe faze ≈ 0.", fontsize=8, color=C_MUTED)
+    # liniile de referință intră în legendă (etichetele în grafic s-ar suprapune)
+    from matplotlib.lines import Line2D
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    handles += [Line2D([], [], color=C_INK, lw=1.2, ls="--"),
+                Line2D([], [], color=C_MUTED, lw=1, ls=":")]
+    labels += ["prag H1 (0,3)", "media pe faze (0,125)"]
+    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, fontsize=9)
+    fig.tight_layout(rect=(0, 0.08, 1, 0.93))
+    out = out or f"figures/main_{metric}_k{k}.png"
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out, tab
+
+
 # Modelele Chronos disponibile: nume scurt -> (nume în tabel, ID Hugging Face)
 CHRONOS_MODELS = {
     "small": ("chronos_bolt_small", "amazon/chronos-bolt-small"),
@@ -377,7 +512,24 @@ if __name__ == "__main__":
     #   python echo_poc.py --chronos small,c2       + doar cele alese
     #   python echo_poc.py --plot --chronos small --kind burst --amp 3 --seed 3
     #   python echo_poc.py --grid --chronos         grila P=24 și 48 -> results/grid.csv
+    #   python echo_poc.py --main                   graficul principal din results/grid.csv
     import sys
+
+    if "--main" in sys.argv:
+        # nu are nevoie de modele: citește doar CSV-ul produs de --grid
+        import os
+        import pandas as pd
+        csv = arg("--csv") or "results/grid.csv"
+        tabs = []
+        for k in (1, 2):
+            path, tab = plot_main(csv, k=k)
+            tabs.append(tab)
+            print(f"salvat: {path}")
+        tab = pd.concat(tabs)
+        os.makedirs("results", exist_ok=True)
+        tab.to_csv("results/summary_ci.csv", index=False)
+        print("tabel cu medii și IC: results/summary_ci.csv")
+        sys.exit(0)
 
     def baselines(P):
         """Baseline-urile depind de perioadă, deci le refacem pentru fiecare P."""
