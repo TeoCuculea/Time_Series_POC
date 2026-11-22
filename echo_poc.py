@@ -975,13 +975,16 @@ def h3_summary(df, n_boot=2000, seed=0):
     return pd.DataFrame(out)
 
 
-def mask_cost_test(forecasters, periods=(24, 48), ks=(1, 2), n_series=100, frac=0.5):
-    """Costul unei alarme false: mascăm (NaN) un segment NORMAL de P/2.
+def mask_cost_test(forecasters, periods=(24, 48), ks=(1, 2), n_series=100, frac=0.5,
+                   fills=("masca", "interp", "sezonier")):
+    """Costul unei alarme false: „reparăm” un segment NORMAL de P/2.
 
     Pe geamănul curat, la aceeași poziție ca la H3 (offset P/5), comparăm
-    prognoza cu și fără mască față de viitorul real al seriei:
-      mae_full / mae_mask     - eroarea medie absolută pe tot orizontul
-      width_full / width_mask - lățimea medie a intervalului q0.1–q0.9
+    prognoza seriei întregi cu prognoza după fiecare umplere a golului
+    (vezi repair(): masca = NaN, interp = linie dreaptă, sezonier = y[t−P]),
+    față de viitorul real al seriei:
+      mae_full / mae_<umplere>     - eroarea medie absolută pe tot orizontul
+      width_full / width_<umplere> - lățimea medie a intervalului q0.1–q0.9
     Viitorul real vine din aceeași serie generată mai lung (același seed
     dă aceleași prime C valori, verificat)."""
     rows = []
@@ -992,18 +995,18 @@ def mask_cost_test(forecasters, periods=(24, 48), ks=(1, 2), n_series=100, frac=
         ctx, truth = full[:, :C], full[:, C:]
         for k in ks:
             start, lo, hi = layout(C, P, k, off, L)
-            masked = ctx.copy()
-            masked[:, start:start + L] = np.nan
+            filled = {how: np.array([repair(y, start, L, how, P) for y in ctx]) for how in fills}
             for name, f in forecasters.items():
                 med_f, q10_f, q90_f = split_q(f(ctx, P))
-                med_m, q10_m, q90_m = split_q(f(masked, P))
+                out = {how: split_q(f(x, P)) for how, x in filled.items()}
                 for i in range(n_series):
-                    rows.append(dict(
-                        model=name, period=P, k=k, series=i,
-                        mae_full=np.abs(med_f[i] - truth[i]).mean(),
-                        mae_mask=np.abs(med_m[i] - truth[i]).mean(),
-                        width_full=(q90_f[i] - q10_f[i]).mean(),
-                        width_mask=(q90_m[i] - q10_m[i]).mean()))
+                    row = dict(model=name, period=P, k=k, series=i,
+                               mae_full=np.abs(med_f[i] - truth[i]).mean(),
+                               width_full=(q90_f[i] - q10_f[i]).mean())
+                    for how, (med, q10, q90) in out.items():
+                        row[f"mae_{how}"] = np.abs(med[i] - truth[i]).mean()
+                        row[f"width_{how}"] = (q90[i] - q10[i]).mean()
+                    rows.append(row)
     return rows
 
 
@@ -1284,6 +1287,96 @@ def plot_plausibility(df, min_amp=0.5, out_pos="figures/plaus_positions.png",
     fig.savefig(out_dose, dpi=150)
     plt.close(fig)
     return out_pos, out_dose
+
+
+AMP_BINS = (0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 10.0)
+
+
+def position_r2(df, bins=AMP_BINS):
+    """Cât explică poziția (vale/pantă/vârf) DUPĂ ce știm deja amplitudinea?
+
+    Două regresii liniare pe rânduri individuale (o serie la o amplitudine):
+      R² amplitudine          : echo ~ intervalul de amplitudine (variabile 0/1)
+      R² amplitudine + poziție: la fel, plus eticheta poziției
+    ΔR² mic = curbele se suprapun: ecoul depinde de mărime, nu de interval."""
+    import pandas as pd
+    out = []
+    for (m, P), g in df.groupby(["model", "period"]):
+        b = pd.cut(g["amp"], bins).astype(str)
+        X1 = pd.get_dummies(b, dtype=float)
+        X2 = pd.concat([X1, pd.get_dummies(g["label"], drop_first=True, dtype=float)], axis=1)
+        y = g["echo"].values
+
+        def r2(X):
+            beta, *_ = np.linalg.lstsq(X.values, y, rcond=None)
+            return 1 - ((y - X.values @ beta) ** 2).sum() / ((y - y.mean()) ** 2).sum()
+        r_a, r_ap = r2(X1), r2(X2)
+        out.append(dict(model=m, period=P, r2_amp=r_a, r2_amp_poz=r_ap, delta_r2=r_ap - r_a, n=len(g)))
+    return pd.DataFrame(out)
+
+
+def plot_dose_abs(df, out="figures/plaus_dose_abs.png", bins=AMP_BINS, min_n=10):
+    """Doză–răspuns pe amplitudinea ABSOLUTĂ (σ), toate pozițiile pe același panou.
+
+    Folosește toate rafalele în sus din plausibility.csv (sweep, in_range,
+    out_range). Amplitudinile se grupează în intervale; un punct = media
+    ecoului dintr-un interval (minim min_n serii), cu IC 95%."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from matplotlib.ticker import NullLocator
+
+    up = df[(df["direction"] > 0) & (df["amp"] >= bins[0]) & np.isfinite(df["echo"])].copy()
+    up["bin"] = pd.cut(up["amp"], bins)
+    r2 = position_r2(up, bins)
+    models = [m for m in TSFM_STYLE if m in set(up["model"])]
+    periods = sorted(up["period"].unique())
+    ramp = {"vale": "#86b6ef", "pantă": "#2a78d6", "vârf": "#0d366b"}
+    fig, axes = plt.subplots(len(periods), len(models), figsize=(3.1 * len(models), 3.2 * len(periods)),
+                             sharey=True, squeeze=False)
+    for r, P in enumerate(periods):
+        for c, m in enumerate(models):
+            ax = axes[r, c]
+            g = up[(up["model"] == m) & (up["period"] == P)]
+            for lab, col in ramp.items():
+                s = (g[g["label"] == lab].groupby("bin", observed=True)
+                     .agg(x=("amp", lambda a: np.exp(np.log(a).mean())),
+                          mean=("echo", "mean"), sem=("echo", "sem"), n=("echo", "size")))
+                s = s[s["n"] >= min_n]
+                ax.fill_between(s["x"], s["mean"] - 1.96 * s["sem"], s["mean"] + 1.96 * s["sem"],
+                                color=col, alpha=0.15, lw=0)
+                ax.plot(s["x"], s["mean"], color=col, lw=2, marker="o", ms=3, label=lab)
+            q = r2[(r2["model"] == m) & (r2["period"] == P)].iloc[0]
+            ax.text(0.97, 0.97, f"ΔR² poziție = {q['delta_r2']:.3f}\nR² amplitudine = {q['r2_amp']:.2f}",
+                    transform=ax.transAxes, ha="right", va="top", fontsize=7.5, color=C_INK)
+            ax.axhline(0, color=C_MUTED, lw=0.8)
+            ax.axhline(H1_THRESHOLD, color=C_INK, lw=1, ls="--")
+            ax.set_xscale("log")
+            ax.xaxis.set_minor_locator(NullLocator())
+            ax.set_xticks([0.25, 0.5, 1, 2, 4, 8])
+            ax.set_xticklabels(["0,25", "0,5", "1", "2", "4", "8"])
+            ax.set_title(TSFM_STYLE[m][0], fontsize=9, color=C_INK, loc="left")
+            if c == 0:
+                ax.set_ylabel(f"echo, P={P}", fontsize=9)
+            if r == len(periods) - 1:
+                ax.set_xlabel("amplitudinea anomaliei (σ)", fontsize=8)
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.spines[["left", "bottom"]].set_color(C_MUTED)
+            ax.tick_params(colors=C_MUTED, labelsize=7)
+            ax.grid(axis="y", color=C_GRID, lw=0.6)
+            ax.set_axisbelow(True)
+    fig.suptitle("Doză–răspuns pe amplitudinea absolută: se suprapun curbele pozițiilor? "
+                 "(rafală P/2 în sus, k=1, medie ± IC 95%)", fontsize=11, color=C_INK, x=0.01, ha="left")
+    h, l = axes[0, 0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", ncol=3, frameon=False, fontsize=9,
+               title="poziția anomaliei", title_fontsize=9)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.95))
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out, r2
 
 
 def plot_exceed(df, out="figures/exceed_echo.png", len_frac=0.5, k=1):
