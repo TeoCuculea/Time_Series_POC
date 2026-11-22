@@ -971,6 +971,100 @@ def h3_summary(df, n_boot=2000, seed=0):
     return pd.DataFrame(out)
 
 
+# ----------------------------------------------------------------------------
+# 10. Plauzibilitate: anomalia rămâne în intervalul normal al seriei?
+# ----------------------------------------------------------------------------
+
+def exceedance(clean_ctx, anom_ctx, start, L):
+    """Cât iese anomalia din intervalul [min, max] al contextului CURAT.
+
+    Întoarce (exceed_frac, exceed_max):
+      exceed_frac - fracțiunea din cele L puncte ale anomaliei aflate în afara
+                    intervalului (0 = toată anomalia arată „plauzibil”)
+      exceed_max  - cea mai mare depășire, în deviații standard ale seriei
+                    (0 dacă nu iese deloc)"""
+    lo, hi, sd = clean_ctx.min(), clean_ctx.max(), clean_ctx.std()
+    seg = anom_ctx[start:start + L]
+    out = np.maximum(np.maximum(seg - hi, 0), np.maximum(lo - seg, 0))
+    return (out > 0).mean(), out.max() / sd
+
+
+def add_exceedance(df, n_periods_ctx=8):
+    """Adaugă exceed_frac și exceed_max la fiecare rând din grid2.csv.
+
+    Nu rulează niciun model: seriile se refac exact din seed (make_series și
+    inject sunt deterministe). Depășirea nu depinde de model, deci o
+    calculăm o singură dată per (P, tip, L, offset, amp, k, serie)."""
+    import pandas as pd
+    keys = ["period", "kind", "L", "offset", "amp", "k", "series"]
+    rows = []
+    for P, kind, L, off, amp, k, s in df[keys].drop_duplicates().itertuples(index=False):
+        C = n_periods_ctx * P
+        start, _, _ = layout(C, P, k, off, L)
+        clean = make_series(C, P, seed=s)
+        anom = inject(clean, start, L, kind, amp)
+        ef, em = exceedance(clean, anom, start, L)
+        rows.append(dict(period=P, kind=kind, L=L, offset=off, amp=amp, k=k, series=s,
+                         exceed_frac=ef, exceed_max=em))
+    return df.merge(pd.DataFrame(rows), on=keys, how="left")
+
+
+def plot_exceed(df, out="figures/exceed_echo.png", len_frac=0.5, k=1):
+    """Ecoul față de exceed_frac, pe rafala de P/2 la k=1.
+
+    Rânduri = perioade, coloane = modele; culoarea = amplitudinea (o singură
+    nuanță, deschis -> închis). În colț: Spearman pe toate punctele și
+    media Spearman-ului calculat separat pe fiecare amplitudine."""
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    sub = df[(df["kind"] == "burst") & (df["len_frac"] == len_frac) & (df["k"] == k)]
+    models = [m for m in TSFM_STYLE if m in set(sub["model"])]
+    periods, amps = sorted(sub["period"].unique()), sorted(sub["amp"].unique())
+    ramp = ["#86b6ef", "#2a78d6", "#0d366b"]
+    rng = np.random.default_rng(0)
+    fig, axes = plt.subplots(len(periods), len(models), figsize=(3 * len(models), 3.2 * len(periods)),
+                             sharex=True, sharey=True, squeeze=False)
+    for r, P in enumerate(periods):
+        for c, m in enumerate(models):
+            ax = axes[r, c]
+            g = sub[(sub["period"] == P) & (sub["model"] == m)]
+            for j, amp in enumerate(amps):
+                ga = g[g["amp"] == amp]
+                jitter = rng.uniform(-0.012, 0.012, len(ga))   # exceed_frac e discret
+                ax.scatter(ga["exceed_frac"] + jitter, ga["echo"], s=10, color=ramp[j],
+                           alpha=0.7, lw=0, label=f"{amp:g}σ")
+            rho_all = g["exceed_frac"].corr(g["echo"], method="spearman")
+            rho_amp = np.nanmean([ga["exceed_frac"].corr(ga["echo"], method="spearman")
+                                  for _, ga in g.groupby("amp")])
+            ax.text(0.98, 0.97, f"ρ toate = {rho_all:.2f}\nρ pe amp. = {rho_amp:.2f}",
+                    transform=ax.transAxes, ha="right", va="top", fontsize=8, color=C_INK)
+            ax.axhline(0, color=C_MUTED, lw=0.8)
+            ax.axhline(H1_THRESHOLD, color=C_INK, lw=1, ls="--")
+            ax.set_title(f"{TSFM_STYLE[m][0]}, P={P}", fontsize=9, color=C_INK, loc="left")
+            if c == 0:
+                ax.set_ylabel("echo", fontsize=9)
+            if r == len(periods) - 1:
+                ax.set_xlabel("exceed_frac", fontsize=9)
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.spines[["left", "bottom"]].set_color(C_MUTED)
+            ax.tick_params(colors=C_MUTED, labelsize=8)
+            ax.grid(color=C_GRID, lw=0.6)
+            ax.set_axisbelow(True)
+    fig.suptitle("Ecou față de fracțiunea anomaliei aflată în afara intervalului seriei curate "
+                 "(rafală P/2, k=1; un punct = o serie)", fontsize=11, color=C_INK, x=0.01, ha="left")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=9,
+               title="amplitudine", title_fontsize=9)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.95))
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out
+
+
 # Modelele Chronos disponibile: nume scurt -> (nume în tabel, ID Hugging Face)
 CHRONOS_MODELS = {
     "small": ("chronos_bolt_small", "amazon/chronos-bolt-small"),
@@ -1041,6 +1135,15 @@ if __name__ == "__main__":
         os.makedirs("results", exist_ok=True)
         pd.concat(tabs).to_csv("results/summary2_ci.csv", index=False)
         print("tabel cu medii și IC: results/summary2_ci.csv")
+        sys.exit(0)
+
+    if "--exceed" in sys.argv:
+        # Pasul A de plauzibilitate: depășirea intervalului, fără rulări de modele
+        import pandas as pd
+        df = add_exceedance(pd.read_csv(arg("--csv") or "results/grid2.csv"))
+        df.to_csv("results/grid2_exceed.csv", index=False)
+        print("salvat: results/grid2_exceed.csv")
+        print("salvat:", plot_exceed(df))
         sys.exit(0)
 
     def baselines(P):
