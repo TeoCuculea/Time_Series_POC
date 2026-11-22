@@ -228,9 +228,9 @@ def run(forecasters, period=24, n_periods_ctx=8, horizon=None, kinds=("spike", "
                     fc_a = f(anom, horizon)
                     for i in range(n_series):
                         r_in, r_abs, r_out = echo_ratio(fc_a[i], fc_c[i], lo, hi, inj[i])
-                        rows.append(dict(model=name, kind=kind, amp=amp, k=k,
-                                         series=i, echo=r_in, echo_abs=r_abs,
-                                         control=r_out))
+                        rows.append(dict(model=name, period=period, kind=kind,
+                                         amp=amp, k=k, series=i, echo=r_in,
+                                         echo_abs=r_abs, control=r_out))
     return rows
 
 
@@ -249,7 +249,7 @@ def summarize(rows):
     import pandas as pd
     df = pd.DataFrame(rows)
     df["high"] = df["echo"] > 0.5
-    return (df.groupby(["model", "kind", "k", "amp"])
+    return (df.groupby(["model", "period", "kind", "k", "amp"])
               .agg(echo=("echo", "mean"), echo_abs=("echo_abs", "mean"),
                    frac_high=("high", "mean"), control=("control", "mean"))
               .round(3))
@@ -376,20 +376,43 @@ if __name__ == "__main__":
     #   python echo_poc.py --chronos                + toate modelele Chronos
     #   python echo_poc.py --chronos small,c2       + doar cele alese
     #   python echo_poc.py --plot --chronos small --kind burst --amp 3 --seed 3
+    #   python echo_poc.py --grid --chronos         grila P=24 și 48 -> results/grid.csv
     import sys
-    P = 24
-    forecasters = {
-        "seasonal_naive": batchify(seasonal_naive, P),
-        "seasonal_mean": batchify(seasonal_mean, P),
-        "seasonal_median": batchify(seasonal_median, P),
-        "context_parrot": lambda batch, h: np.array([context_parrot(c, h) for c in batch]),
-    }
+
+    def baselines(P):
+        """Baseline-urile depind de perioadă, deci le refacem pentru fiecare P."""
+        return {
+            "seasonal_naive": batchify(seasonal_naive, P),
+            "seasonal_mean": batchify(seasonal_mean, P),
+            "seasonal_median": batchify(seasonal_median, P),
+            "context_parrot": lambda batch, h: np.array([context_parrot(c, h) for c in batch]),
+        }
+
+    # Modelele Chronos nu depind de perioadă: le încărcăm o singură dată
+    tsfm = {}
     chosen = arg("--chronos")
     if chosen is not None:
         keys = chosen.split(",") if chosen else list(CHRONOS_MODELS)
         for key in keys:
             name, model_id = CHRONOS_MODELS[key]
-            forecasters[name] = make_chronos(model_id)
+            tsfm[name] = make_chronos(model_id)
+
+    if "--grid" in sys.argv:
+        import os
+        import pandas as pd
+        rows = []
+        for P in (24, 48):
+            rows += run({**baselines(P), **tsfm}, period=P)
+            print(f"P={P}: gata")
+        os.makedirs("results", exist_ok=True)
+        out = arg("--out") or "results/grid.csv"
+        pd.DataFrame(rows).to_csv(out, index=False)   # un rând per serie
+        print(f"{len(rows)} rânduri salvate în {out}\n")
+        print(summarize(rows).to_string())
+        sys.exit(0)
+
+    P = 24
+    forecasters = {**baselines(P), **tsfm}
     if "--plot" in sys.argv:
         # câte un grafic per model, la k=1 și k=2, apoi ne oprim
         seed = int(arg("--seed", 0))
